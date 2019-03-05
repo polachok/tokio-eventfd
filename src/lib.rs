@@ -6,16 +6,23 @@ use libc;
 use mio::unix::EventedFd;
 use mio::{self, Evented, PollOpt, Ready, Token};
 
-use futures::{Async, Poll};
+use futures::{Async, Poll, Sink, Stream, AsyncSink, try_ready};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_reactor::PollEvented;
 
-#[derive(Clone)]
 struct Inner(RawFd);
 
 impl Inner {
     fn new() -> Result<Self> {
         let rv = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
+        if rv < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Inner(rv))
+    }
+
+    fn try_clone(&self) -> Result<Self> {
+        let rv = unsafe { libc::dup(self.0) };
         if rv < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -97,6 +104,39 @@ impl EventFd {
     pub fn clear_read_ready(&self, mask: Ready) -> Result<()> {
         self.0.clear_read_ready(mask)
     }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        let inner = self.0.get_ref().try_clone()?;
+        Ok(EventFd(PollEvented::new(inner)))
+    }
+}
+
+impl Stream for EventFd {
+    type Item = u64;
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        let mut buf = [0; 8];
+        try_ready!(self.poll_read(&mut buf));
+        Ok(Async::Ready(Some(u64::from_ne_bytes(buf))))
+    }
+}
+
+impl Sink for EventFd {
+    type SinkItem = u64;
+    type SinkError = io::Error;
+
+    fn start_send(&mut self, item: Self::SinkItem) -> Result<AsyncSink<Self::SinkItem>> {
+        match self.poll_write(&item.to_ne_bytes()) {
+            Ok(Async::Ready(_)) => Ok(AsyncSink::Ready),
+            Ok(Async::NotReady) => Ok(AsyncSink::NotReady(item)),
+            Err(err) => Err(err)
+        }
+    }
+
+    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+        Ok(Async::Ready(()))
+    }
 }
 
 impl AsRawFd for EventFd {
@@ -146,42 +186,14 @@ impl AsyncWrite for EventFd {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::{BufMut, ByteOrder, BytesMut, LittleEndian};
     use std::time::{Instant, Duration};
-    use tokio::codec::{Decoder, Encoder, Framed};
     use tokio::prelude::*;
     use tokio::timer::Interval;
 
-    struct C;
-
-    impl Encoder for C {
-        type Item = u64;
-        type Error = std::io::Error;
-
-        fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> Result<()> {
-            dst.put_u64::<LittleEndian>(item);
-            Ok(())
-        }
-    }
-
-    impl Decoder for C {
-        type Item = u64;
-        type Error = std::io::Error;
-
-        fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
-            if src.len() < 8 {
-                return Ok(None);
-            }
-            let rv = LittleEndian::read_u64(&src);
-            src.advance(8);
-            Ok(Some(rv))
-        }
-    }
     #[test]
     fn it_works() {
-        let fd = EventFd::new().unwrap();
-        let framed = Framed::new(fd, C);
-        let (writer, reader) = framed.split();
+        let writer = EventFd::new().unwrap();
+        let reader = writer.try_clone().unwrap();
 
         tokio::run(future::lazy(|| {
             tokio::spawn(future::lazy(|| {
