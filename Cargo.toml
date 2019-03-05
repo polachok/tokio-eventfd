@@ -1,0 +1,16 @@
+[package]
+name = "tokio-eventfd"
+version = "0.1.0"
+authors = ["Alexander Polakov <a.polakov@iconic.vc>"]
+edition = "2018"
+
+[dependencies]
+tokio-reactor = "0.1"
+tokio-io = "0.1"
+mio = "0.6"
+futures = "0.1"
+libc = "0.2"
+
+[dev-dependencies]
+tokio = "0.1"
+bytes = "0.4"
