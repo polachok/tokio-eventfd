@@ -1,8 +1,12 @@
 [package]
 name = "tokio-eventfd"
 version = "0.1.0"
-authors = ["Alexander Polakov <a.polakov@iconic.vc>"]
+authors = ["Alexander Polakov <plhk@sdf.org>"]
 edition = "2018"
+description = "Linux eventfd for tokio"
+documentation = "https://docs.rs/tokio-eventfd"
+repository = "https://github.com/polachok/tokio-eventfd"
+license = "MIT"
 
 [dependencies]
 tokio-reactor = "0.1"
