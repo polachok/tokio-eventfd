@@ -1,20 +1,26 @@
 use std::io::{self, Result};
-use std::os::unix::io::{RawFd, AsRawFd, FromRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
 use libc;
 
 use mio::unix::EventedFd;
 use mio::{self, Evented, PollOpt, Ready, Token};
 
-use futures::{Async, Poll, Sink, Stream, AsyncSink, try_ready};
+use futures::{try_ready, Async, AsyncSink, Poll, Sink, Stream};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_reactor::PollEvented;
 
 struct Inner(RawFd);
 
 impl Inner {
-    fn new() -> Result<Self> {
-        let rv = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
+    fn new(sem: bool) -> Result<Self> {
+        let flags = libc::EFD_NONBLOCK | libc::EFD_CLOEXEC;
+        let flags = if sem {
+            flags | libc::EFD_SEMAPHORE
+        } else {
+            flags
+        };
+        let rv = unsafe { libc::eventfd(0, flags) };
         if rv < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -27,6 +33,12 @@ impl Inner {
             return Err(io::Error::last_os_error());
         }
         Ok(Inner(rv))
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
     }
 }
 
@@ -84,25 +96,9 @@ impl Evented for Inner {
 pub struct EventFd(PollEvented<Inner>);
 
 impl EventFd {
-    pub fn new() -> Result<Self> {
-        let inner = Inner::new()?;
+    pub fn new(semaphore: bool) -> Result<Self> {
+        let inner = Inner::new(semaphore)?;
         Ok(EventFd(PollEvented::new(inner)))
-    }
-
-    pub fn poll_write_ready(&self) -> Poll<Ready, io::Error> {
-        self.0.poll_write_ready()
-    }
-
-    pub fn clear_write_ready(&self) -> Result<()> {
-        self.0.clear_write_ready()
-    }
-
-    pub fn poll_read_ready(&self, mask: Ready) -> Poll<Ready, io::Error> {
-        self.0.poll_read_ready(mask)
-    }
-
-    pub fn clear_read_ready(&self, mask: Ready) -> Result<()> {
-        self.0.clear_read_ready(mask)
     }
 
     pub fn try_clone(&self) -> Result<Self> {
@@ -116,9 +112,16 @@ impl Stream for EventFd {
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        let ready = Ready::readable();
+        let ready = try_ready!(self.0.poll_read_ready(ready));
         let mut buf = [0; 8];
-        try_ready!(self.poll_read(&mut buf));
-        Ok(Async::Ready(Some(u64::from_ne_bytes(buf))))
+        match self.poll_read(&mut buf)? {
+            Async::NotReady => {
+                self.0.clear_read_ready(ready)?;
+                Ok(Async::NotReady)
+            }
+            Async::Ready(_) => Ok(Async::Ready(Some(u64::from_ne_bytes(buf)))),
+        }
     }
 }
 
@@ -127,10 +130,17 @@ impl Sink for EventFd {
     type SinkError = io::Error;
 
     fn start_send(&mut self, item: Self::SinkItem) -> Result<AsyncSink<Self::SinkItem>> {
+        if let Async::NotReady = self.0.poll_write_ready()? {
+            return Ok(AsyncSink::NotReady(item));
+        }
+
         match self.poll_write(&item.to_ne_bytes()) {
             Ok(Async::Ready(_)) => Ok(AsyncSink::Ready),
-            Ok(Async::NotReady) => Ok(AsyncSink::NotReady(item)),
-            Err(err) => Err(err)
+            Ok(Async::NotReady) => {
+                self.0.clear_write_ready()?;
+                Ok(AsyncSink::NotReady(item))
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -186,34 +196,58 @@ impl AsyncWrite for EventFd {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Instant, Duration};
+    use std::time::{Duration, Instant};
     use tokio::prelude::*;
     use tokio::timer::Interval;
 
     #[test]
-    fn it_works() {
-        let writer = EventFd::new().unwrap();
+    fn increment_many() {
+        let writer = EventFd::new(true).unwrap();
         let reader = writer.try_clone().unwrap();
 
-        tokio::run(future::lazy(|| {
-            tokio::spawn(future::lazy(|| {
-               reader 
-                    .for_each(|msg| {
-                        println!("{:?} received {}", Instant::now(), msg);
-                        Ok(())
-                    })
+        tokio::run(future::lazy(move || {
+            tokio::spawn(
+                stream::repeat(1)
+                    .take(5)
+                    .map_err(|_: ()| std::io::Error::new(std::io::ErrorKind::Other, "timer!"))
+                    .forward(writer)
                     .map_err(|err| panic!(err))
-                }));
-            Interval::new_interval(Duration::from_secs(1))
+                    .map(|_| ()),
+            );
+            reader
+                .for_each(|x| {
+                    println!("{}", x);
+                    Ok(())
+                })
+                .map_err(|err| panic!(err))
+        }));
+    }
+
+    #[test]
+    fn it_works() {
+        let writer = EventFd::new(true).unwrap();
+        let reader = writer.try_clone().unwrap();
+
+        tokio::run(future::lazy(move || {
+            let sender = Interval::new_interval(Duration::from_secs(1))
+                .take(5)
                 .map(|_| {
                     println!("{:?} sent {}", Instant::now(), 1);
                     1u64
                 })
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "timer!"))
+                .fuse()
                 .forward(writer)
                 .map_err(|err| panic!(err))
-                .map(|_| ())
+                .map(|_| ());
 
+            let receiver = reader
+                .for_each(|msg| {
+                    println!("{:?} received {}", Instant::now(), msg);
+                    Ok(())
+                })
+                .map_err(|err| panic!(err));
+            receiver.join(sender).map(|_| ()).map_err(|_| ())
         }))
     }
 }
