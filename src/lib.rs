@@ -214,9 +214,10 @@ mod tests {
                     .map_err(|err| panic!(err))
                     .map(|_| ()),
             );
-            reader
+            Stream::take(reader, 5)
                 .for_each(|x| {
                     println!("{}", x);
+                    assert_eq!(x, 1);
                     Ok(())
                 })
                 .map_err(|err| panic!(err))
@@ -241,9 +242,10 @@ mod tests {
                 .map_err(|err| panic!(err))
                 .map(|_| ());
 
-            let receiver = reader
+            let receiver = Stream::take(reader, 5)
                 .for_each(|msg| {
                     println!("{:?} received {}", Instant::now(), msg);
+                    assert_eq!(msg, 1);
                     Ok(())
                 })
                 .map_err(|err| panic!(err));
