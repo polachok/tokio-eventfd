@@ -201,6 +201,79 @@ mod tests {
     use tokio::timer::Interval;
 
     #[test]
+    fn almost_bench_current() {
+        use tokio::runtime::current_thread::{Runtime, TaskExecutor};
+        let writer = EventFd::new(true).unwrap();
+        let reader = writer.try_clone().unwrap();
+        let mut counter: u64 = 0;
+
+        const WAKEUPS: u64 = 1_000_000;
+
+        let mut rt = Runtime::new().unwrap();
+
+        rt.spawn(future::lazy(move || {
+            let started = Instant::now();
+            let mut executor = TaskExecutor::current();
+            executor.spawn_local(Box::new(
+                stream::repeat(1)
+                    .take(WAKEUPS)
+                    .map_err(|_: ()| std::io::Error::new(std::io::ErrorKind::Other, "timer!"))
+                    .forward(writer)
+                    .map_err(|err| panic!(err))
+                    .map(|_| ()),
+            )).unwrap();
+            reader.for_each(move |_| {
+                counter += 1;
+                if counter == WAKEUPS {
+                    let elapsed = started.elapsed();
+                    let nanos = elapsed.subsec_nanos();
+                    let secs = elapsed.as_secs();
+                    let total = secs * 1_000_000_000 + nanos as u64;
+                    let one = total / WAKEUPS;
+                    println!("{} wakeups took {:?}, total {}, {:?}/wakeup", WAKEUPS, elapsed, total, Duration::from_nanos(one));
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "please stop"));
+                }
+                Ok(())
+            }).then(|_| Ok(()))
+        }));
+        rt.run().unwrap();
+    }
+
+    #[test]
+    fn almost_bench_default() {
+        let writer = EventFd::new(true).unwrap();
+        let reader = writer.try_clone().unwrap();
+        let mut counter: u64 = 0;
+
+        const WAKEUPS: u64 = 1_000_000;
+
+        tokio::run(future::lazy(move || {
+            let started = Instant::now();
+            tokio::spawn(
+                stream::repeat(1)
+                    .take(WAKEUPS)
+                    .map_err(|_: ()| std::io::Error::new(std::io::ErrorKind::Other, "timer!"))
+                    .forward(writer)
+                    .map_err(|err| panic!(err))
+                    .map(|_| ()),
+            );
+            reader.for_each(move |_| {
+                counter += 1;
+                if counter == WAKEUPS {
+                    let elapsed = started.elapsed();
+                    let nanos = elapsed.subsec_nanos();
+                    let secs = elapsed.as_secs();
+                    let total = secs * 1_000_000_000 + nanos as u64;
+                    let one = total / WAKEUPS;
+                    println!("{} wakeups took {:?}, total {}, {:?}/wakeup", WAKEUPS, elapsed, total, Duration::from_nanos(one));
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "please stop"));
+                }
+                Ok(())
+            }).then(|_| Ok(()))
+        }));
+    }
+
+    #[test]
     fn increment_many() {
         let writer = EventFd::new(true).unwrap();
         let reader = writer.try_clone().unwrap();
