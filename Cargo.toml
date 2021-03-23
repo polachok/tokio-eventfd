@@ -1,6 +1,6 @@
 [package]
 name = "tokio-eventfd"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Alexander Polakov <plhk@sdf.org>"]
 edition = "2018"
 description = "Linux eventfd for tokio"
@@ -9,12 +9,9 @@ repository = "https://github.com/polachok/tokio-eventfd"
 license = "MIT"
 
 [dependencies]
-tokio-reactor = "0.1"
-tokio-io = "0.1"
-mio = "0.6"
-futures = "0.1"
+tokio = { version = "1.0", features = ["net"] }
+futures-lite = "1.11"
 libc = "0.2"
 
 [dev-dependencies]
-tokio = "0.1"
-bytes = "0.4"
+tokio = { version = "1.0", features = ["net", "rt", "test-util", "macros", "io-util", "time" ] }

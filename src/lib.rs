@@ -1,26 +1,29 @@
-use std::io::{self, Result};
+//! This crate provides eventfd file-like objects support for tokio.
+//! eventfd object can be used as an event
+//! wait/notify mechanism by user-space applications, and by
+//! the kernel to notify user-space applications of events.
+//! The object contains an unsigned 64-bit integer counter
+//! that is maintained by the kernel.
+use std::io::{self, Read, Result, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use libc;
-
-use mio::unix::EventedFd;
-use mio::{self, Evented, PollOpt, Ready, Token};
-
-use futures::{try_ready, Async, AsyncSink, Poll, Sink, Stream};
-use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_reactor::PollEvented;
+use futures_lite::ready;
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 struct Inner(RawFd);
 
 impl Inner {
-    fn new(sem: bool) -> Result<Self> {
+    fn new(init: u32, is_semaphore: bool) -> Result<Self> {
         let flags = libc::EFD_NONBLOCK | libc::EFD_CLOEXEC;
-        let flags = if sem {
+        let flags = if is_semaphore {
             flags | libc::EFD_SEMAPHORE
         } else {
             flags
         };
-        let rv = unsafe { libc::eventfd(0, flags) };
+        let rv = unsafe { libc::eventfd(init, flags) };
         if rv < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -42,7 +45,13 @@ impl Drop for Inner {
     }
 }
 
-impl io::Read for Inner {
+impl AsRawFd for Inner {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+impl<'a> io::Read for &'a Inner {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let rv =
             unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut std::ffi::c_void, buf.len()) };
@@ -53,7 +62,7 @@ impl io::Read for Inner {
     }
 }
 
-impl io::Write for Inner {
+impl<'a> io::Write for &'a Inner {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         let rv = unsafe { libc::write(self.0, buf.as_ptr() as *const std::ffi::c_void, buf.len()) };
         if rv < 0 {
@@ -67,85 +76,23 @@ impl io::Write for Inner {
     }
 }
 
-impl Evented for Inner {
-    fn register(
-        &self,
-        poll: &mio::Poll,
-        token: Token,
-        interest: Ready,
-        opts: PollOpt,
-    ) -> Result<()> {
-        poll.register(&EventedFd(&self.0), token, interest, opts)
-    }
-
-    fn reregister(
-        &self,
-        poll: &mio::Poll,
-        token: Token,
-        interest: Ready,
-        opts: PollOpt,
-    ) -> Result<()> {
-        poll.reregister(&EventedFd(&self.0), token, interest, opts)
-    }
-
-    fn deregister(&self, poll: &mio::Poll) -> Result<()> {
-        poll.deregister(&EventedFd(&self.0))
-    }
-}
-
-pub struct EventFd(PollEvented<Inner>);
+pub struct EventFd(AsyncFd<Inner>);
 
 impl EventFd {
-    pub fn new(semaphore: bool) -> Result<Self> {
-        let inner = Inner::new(semaphore)?;
-        Ok(EventFd(PollEvented::new(inner)))
+    /// Create new Eventfd. `init` is the initial value of the counter
+    /// `is_semaphore` determines eventfd behaviour:
+    ///   - if true and counter has non-zero value read returns 8 bytes containing the value 1,
+    ///   and the counter's value is decremented by 1
+    ///   - if false and counter has non-zero value read returns the value and the counter's value
+    ///   is reset to 0.
+    pub fn new(init: u32, is_semaphore: bool) -> Result<Self> {
+        let inner = Inner::new(init, is_semaphore)?;
+        Ok(EventFd(AsyncFd::new(inner)?))
     }
 
     pub fn try_clone(&self) -> Result<Self> {
         let inner = self.0.get_ref().try_clone()?;
-        Ok(EventFd(PollEvented::new(inner)))
-    }
-}
-
-impl Stream for EventFd {
-    type Item = u64;
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        let ready = Ready::readable();
-        let ready = try_ready!(self.0.poll_read_ready(ready));
-        let mut buf = [0; 8];
-        match self.poll_read(&mut buf)? {
-            Async::NotReady => {
-                self.0.clear_read_ready(ready)?;
-                Ok(Async::NotReady)
-            }
-            Async::Ready(_) => Ok(Async::Ready(Some(u64::from_ne_bytes(buf)))),
-        }
-    }
-}
-
-impl Sink for EventFd {
-    type SinkItem = u64;
-    type SinkError = io::Error;
-
-    fn start_send(&mut self, item: Self::SinkItem) -> Result<AsyncSink<Self::SinkItem>> {
-        if let Async::NotReady = self.0.poll_write_ready()? {
-            return Ok(AsyncSink::NotReady(item));
-        }
-
-        match self.poll_write(&item.to_ne_bytes()) {
-            Ok(Async::Ready(_)) => Ok(AsyncSink::Ready),
-            Ok(Async::NotReady) => {
-                self.0.clear_write_ready()?;
-                Ok(AsyncSink::NotReady(item))
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
-        Ok(Async::Ready(()))
+        Ok(EventFd(AsyncFd::new(inner)?))
     }
 }
 
@@ -157,172 +104,112 @@ impl AsRawFd for EventFd {
 
 impl FromRawFd for EventFd {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        EventFd(PollEvented::new(Inner(fd)))
-    }
-}
-
-impl io::Read for EventFd {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.0.read(buf)
+        EventFd(AsyncFd::new(Inner(fd)).unwrap())
     }
 }
 
 impl AsyncRead for EventFd {
-    fn poll_read(&mut self, buf: &mut [u8]) -> Poll<usize, io::Error> {
-        self.0.poll_read(buf)
-    }
-}
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<Result<()>> {
+        let mut guard = ready!(self.0.poll_read_ready(cx))?;
 
-impl io::Write for EventFd {
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        self.0.flush()
+        let count = match guard.try_io(|inner| {
+            let buf = unsafe {
+                &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
+            };
+            inner.get_ref().read(buf)
+        }) {
+            Ok(result) => result?,
+            Err(_) => return Poll::Pending,
+        };
+        unsafe { buf.assume_init(count) };
+        buf.advance(count);
+        Poll::Ready(Ok(()))
     }
 }
 
 impl AsyncWrite for EventFd {
-    fn poll_write(&mut self, buf: &[u8]) -> Poll<usize, io::Error> {
-        self.0.poll_write(buf)
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            let mut guard = ready!(self.0.poll_write_ready(cx))?;
+
+            match guard.try_io(|inner| inner.get_ref().write(buf)) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
     }
 
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        Ok(Async::Ready(()))
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
-    use tokio::prelude::*;
-    use tokio::timer::Interval;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::sleep;
 
-    #[test]
-    fn almost_bench_current() {
-        use tokio::runtime::current_thread::{Runtime, TaskExecutor};
-        let writer = EventFd::new(true).unwrap();
-        let reader = writer.try_clone().unwrap();
-        let mut counter: u64 = 0;
+    #[tokio::test]
+    async fn not_semaphore_reads_and_resets() {
+        const VALUE: u64 = 42;
 
-        const WAKEUPS: u64 = 1_000_000;
+        let mut writer = EventFd::new(0, false).unwrap();
+        let mut reader = writer.try_clone().unwrap();
 
-        let mut rt = Runtime::new().unwrap();
+        writer.write(&VALUE.to_ne_bytes()).await.unwrap();
+        let mut buf = [0; 8];
+        reader.read(&mut buf).await.unwrap();
+        assert_eq!(buf, VALUE.to_ne_bytes());
 
-        rt.spawn(future::lazy(move || {
-            let started = Instant::now();
-            let mut executor = TaskExecutor::current();
-            executor.spawn_local(Box::new(
-                stream::repeat(1)
-                    .take(WAKEUPS)
-                    .map_err(|_: ()| std::io::Error::new(std::io::ErrorKind::Other, "timer!"))
-                    .forward(writer)
-                    .map_err(|err| panic!(err))
-                    .map(|_| ()),
-            )).unwrap();
-            reader.for_each(move |_| {
-                counter += 1;
-                if counter == WAKEUPS {
-                    let elapsed = started.elapsed();
-                    let nanos = elapsed.subsec_nanos();
-                    let secs = elapsed.as_secs();
-                    let total = secs * 1_000_000_000 + nanos as u64;
-                    let one = total / WAKEUPS;
-                    println!("{} wakeups took {:?}, total {}, {:?}/wakeup", WAKEUPS, elapsed, total, Duration::from_nanos(one));
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "please stop"));
-                }
-                Ok(())
-            }).then(|_| Ok(()))
-        }));
-        rt.run().unwrap();
+        // check it blocks on zero
+        let delay = sleep(Duration::from_secs(1));
+        let read_should_block = reader.read(&mut buf);
+        tokio::select! {
+            _ = delay => {},
+            val = read_should_block => {
+                panic!("{:?}", val)
+            },
+        }
     }
 
-    #[test]
-    fn almost_bench_default() {
-        let writer = EventFd::new(true).unwrap();
-        let reader = writer.try_clone().unwrap();
-        let mut counter: u64 = 0;
+    #[tokio::test]
+    async fn semaphore_reads_ones() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        const WAKEUPS: u64 = 1_000_000;
+        const VALUE: u64 = 42;
 
-        tokio::run(future::lazy(move || {
-            let started = Instant::now();
-            tokio::spawn(
-                stream::repeat(1)
-                    .take(WAKEUPS)
-                    .map_err(|_: ()| std::io::Error::new(std::io::ErrorKind::Other, "timer!"))
-                    .forward(writer)
-                    .map_err(|err| panic!(err))
-                    .map(|_| ()),
-            );
-            reader.for_each(move |_| {
-                counter += 1;
-                if counter == WAKEUPS {
-                    let elapsed = started.elapsed();
-                    let nanos = elapsed.subsec_nanos();
-                    let secs = elapsed.as_secs();
-                    let total = secs * 1_000_000_000 + nanos as u64;
-                    let one = total / WAKEUPS;
-                    println!("{} wakeups took {:?}, total {}, {:?}/wakeup", WAKEUPS, elapsed, total, Duration::from_nanos(one));
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "please stop"));
-                }
-                Ok(())
-            }).then(|_| Ok(()))
-        }));
-    }
+        let mut writer = EventFd::new(0, true).unwrap();
+        let mut reader = writer.try_clone().unwrap();
 
-    #[test]
-    fn increment_many() {
-        let writer = EventFd::new(true).unwrap();
-        let reader = writer.try_clone().unwrap();
+        writer.write(&VALUE.to_ne_bytes()).await.unwrap();
+        let mut buf = [0; 8];
+        for _ in 0..VALUE {
+            reader.read(&mut buf).await.unwrap();
+            assert_eq!(buf, 1u64.to_ne_bytes());
+        }
 
-        tokio::run(future::lazy(move || {
-            tokio::spawn(
-                stream::repeat(1)
-                    .take(5)
-                    .map_err(|_: ()| std::io::Error::new(std::io::ErrorKind::Other, "timer!"))
-                    .forward(writer)
-                    .map_err(|err| panic!(err))
-                    .map(|_| ()),
-            );
-            Stream::take(reader, 5)
-                .for_each(|x| {
-                    println!("{}", x);
-                    assert_eq!(x, 1);
-                    Ok(())
-                })
-                .map_err(|err| panic!(err))
-        }));
-    }
-
-    #[test]
-    fn it_works() {
-        let writer = EventFd::new(true).unwrap();
-        let reader = writer.try_clone().unwrap();
-
-        tokio::run(future::lazy(move || {
-            let sender = Interval::new_interval(Duration::from_secs(1))
-                .take(5)
-                .map(|_| {
-                    println!("{:?} sent {}", Instant::now(), 1);
-                    1u64
-                })
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "timer!"))
-                .fuse()
-                .forward(writer)
-                .map_err(|err| panic!(err))
-                .map(|_| ());
-
-            let receiver = Stream::take(reader, 5)
-                .for_each(|msg| {
-                    println!("{:?} received {}", Instant::now(), msg);
-                    assert_eq!(msg, 1);
-                    Ok(())
-                })
-                .map_err(|err| panic!(err));
-            receiver.join(sender).map(|_| ()).map_err(|_| ())
-        }))
+        // check it blocks on zero
+        let delay = sleep(Duration::from_secs(1));
+        let read_should_block = reader.read(&mut buf);
+        tokio::select! {
+            _ = delay => {},
+            val = read_should_block => {
+                panic!("{:?}", val)
+            },
+        }
     }
 }
