@@ -114,20 +114,19 @@ impl AsyncRead for EventFd {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<()>> {
-        let mut guard = ready!(self.0.poll_read_ready(cx))?;
+        loop {
+            let mut guard = ready!(self.0.poll_read_ready(cx))?;
 
-        let count = match guard.try_io(|inner| {
-            let buf = unsafe {
-                &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
-            };
-            inner.get_ref().read(buf)
-        }) {
-            Ok(result) => result?,
-            Err(_) => return Poll::Pending,
-        };
-        unsafe { buf.assume_init(count) };
-        buf.advance(count);
-        Poll::Ready(Ok(()))
+            let unfilled = buf.initialize_unfilled();
+            match guard.try_io(|inner| inner.get_ref().read(unfilled)) {
+                Ok(Ok(len)) => {
+                    buf.advance(len);
+                    return Poll::Ready(Ok(()));
+                },
+                Ok(Err(err)) => return Poll::Ready(Err(err)),
+                Err(_would_block) => continue,
+            }
+        }
     }
 }
 
@@ -211,5 +210,28 @@ mod tests {
                 panic!("{:?}", val)
             },
         }
+    }
+
+    #[tokio::test]
+    async fn read_twice() {
+        let mut writer = EventFd::new(0, false).unwrap();
+        let mut reader = writer.try_clone().unwrap();
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let mut buf = [0; 8];
+            reader.read(&mut buf).await.unwrap();
+            tx1.send(()).unwrap();
+            reader.read(&mut buf).await.unwrap();
+            tx2.send(()).unwrap();
+        });
+
+        writer.write(&1u64.to_ne_bytes()).await.unwrap();
+        rx1.await.unwrap();
+        writer.write(&1u64.to_ne_bytes()).await.unwrap();
+        rx2.await.unwrap();
+
+        server.await.unwrap();
     }
 }
