@@ -9,8 +9,7 @@ repository = "https://github.com/polachok/tokio-eventfd"
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1.0", features = ["net"] }
-futures-lite = "2.5"
+tokio = { version = "1.0", features = [] }
 libc = "0.2"
 
 [dev-dependencies]

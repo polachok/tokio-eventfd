@@ -9,7 +9,6 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures_lite::ready;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -115,7 +114,10 @@ impl AsyncRead for EventFd {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<()>> {
         loop {
-            let mut guard = ready!(self.0.poll_read_ready(cx))?;
+            let mut guard = match self.0.poll_read_ready(cx) {
+                Poll::Ready(t) => t?,
+                Poll::Pending => return Poll::Pending,
+            };
 
             let unfilled = buf.initialize_unfilled();
             match guard.try_io(|inner| inner.get_ref().read(unfilled)) {
@@ -137,7 +139,10 @@ impl AsyncWrite for EventFd {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         loop {
-            let mut guard = ready!(self.0.poll_write_ready(cx))?;
+            let mut guard = match self.0.poll_write_ready(cx) {
+                Poll::Ready(t) => t?,
+                Poll::Pending => return Poll::Pending,
+            };
 
             match guard.try_io(|inner| inner.get_ref().write(buf)) {
                 Ok(result) => return Poll::Ready(result),
