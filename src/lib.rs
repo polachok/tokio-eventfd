@@ -5,7 +5,7 @@
 //! The object contains an unsigned 64-bit integer counter
 //! that is maintained by the kernel.
 use std::io::{self, Read, Result, Write};
-use std::os::fd::{AsFd, BorrowedFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -109,15 +109,6 @@ impl FromRawFd for EventFd {
     }
 }
 
-impl From<OwnedFd> for EventFd {
-    /// Converts an OwnedFd into an EventFd. Must be called within the
-    /// context of a Tokio runtime.
-    fn from(owned_fd: OwnedFd) -> Self {
-        // SAFETY: OwnedFd holds valid fd by from_raw_fd.
-        unsafe { Self::from_raw_fd(owned_fd.into_raw_fd()) }
-    }
-}
-
 impl AsFd for EventFd {
     fn as_fd(&self) -> BorrowedFd {
         self.0.as_fd()
@@ -138,7 +129,7 @@ impl AsyncRead for EventFd {
                 Ok(Ok(len)) => {
                     buf.advance(len);
                     return Poll::Ready(Ok(()));
-                },
+                }
                 Ok(Err(err)) => return Poll::Ready(Err(err)),
                 Err(_would_block) => continue,
             }
