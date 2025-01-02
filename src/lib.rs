@@ -1,3 +1,6 @@
+//
+// SPDX-License-Identifier: Apache-2.0
+//
 //! This crate provides eventfd file-like objects support for tokio.
 //! eventfd object can be used as an event
 //! wait/notify mechanism by user-space applications, and by
